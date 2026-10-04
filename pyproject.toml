@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-dialt"
+version = "0.1.0"
+description = "Dialt realtime voice provider integration for Pipecat"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Dialt" }]
+keywords = ["ai", "dialt", "pipecat", "realtime", "voice"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "dialt-sdk>=0.41.0,<0.42",
+  "numpy>=1.26.4,<3",
+  "pipecat-ai>=1.12.0,<2",
+]
+
+[project.optional-dependencies]
+local = ["pyaudio~=0.2.14"]
+
+[project.urls]
+Homepage = "https://github.com/dialt-ai/pipecat-dialt"
+Documentation = "https://github.com/dialt-ai/pipecat-dialt#readme"
+Issues = "https://github.com/dialt-ai/pipecat-dialt/issues"
+Changelog = "https://github.com/dialt-ai/pipecat-dialt/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+  "build>=1.2.2.post1",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.11",
+  "twine>=6.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_dialt"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.amp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "E", "F", "I", "N", "RUF", "UP", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["pipecat_dialt"]
+mypy_path = "src"
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["dialt", "dialt.*", "pipecat", "pipecat.*"]
+ignore_missing_imports = true
