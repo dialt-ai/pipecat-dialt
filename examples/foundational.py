@@ -9,15 +9,10 @@ from dialt import DialtMode
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
-from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from pipecat_dialt import DialtLLMService
+from pipecat_dialt import DialtContextAggregatorPair, DialtLLMService
 
 
 async def main() -> None:
@@ -30,8 +25,10 @@ async def main() -> None:
             audio_out_sample_rate=16_000,
         )
     )
+    context = LLMContext()
     llm = DialtLLMService(
         api_key=os.environ["DIALT_API_KEY"],
+        initial_context=context,
         mode=DialtMode(
             instructions=(
                 "You are a concise, helpful voice assistant. "
@@ -42,14 +39,7 @@ async def main() -> None:
         ),
     )
 
-    context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=ExternalUserTurnStrategies(),
-        ),
-        realtime_service_mode=True,
-    )
+    user_aggregator, assistant_aggregator = DialtContextAggregatorPair(context)
     pipeline = Pipeline(
         [
             transport.input(),

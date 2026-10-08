@@ -648,16 +648,16 @@ wheels = [
 
 [[package]]
 name = "dialt-sdk"
-version = "0.41.0"
+version = "0.45.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fe/4c/344dfaae780a6049644f8cd160625cb5b9790230ab10ae3c4b6659b5ff78/dialt_sdk-0.41.0.tar.gz", hash = "sha256:e73a043514e0c3ff51dd5e2e32afeadd1f80e90a07a898a932aafc5c6752dfe7", size = 83923, upload-time = "2026-09-30T11:36:38.425Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5b/27/be9f83b29613da2e2a5b1b407ed7f5aa950c64b9b35e1f01f8dc9319285e/dialt_sdk-0.45.0.tar.gz", hash = "sha256:30c170a753656cd845d28e2fecdb6d8359532fd68266ed1840943781e87d9588", size = 94725, upload-time = "2026-10-08T10:47:42.129Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/d8/3df2ed3acb2fe034532049dfbfebd68793ed29289545bcd2a2b42231222d/dialt_sdk-0.41.0-py3-none-any.whl", hash = "sha256:5b73d886de70f66ae92ca2146905662723a4dce6f385637615267b0892e4345a", size = 59136, upload-time = "2026-09-30T11:36:37.369Z" },
+    { url = "https://files.pythonhosted.org/packages/31/a4/ac43ea9c195ef40aee3a6c62d92208eeaa6002ebc0c54ebab5516389d8b1/dialt_sdk-0.45.0-py3-none-any.whl", hash = "sha256:9f310e5a3cae2943e35629fc9d3a918e98a44ff7e05efd5a8b6c75d291d3b502", size = 65953, upload-time = "2026-10-08T10:47:40.713Z" },
 ]
 
 [[package]]
@@ -1986,7 +1986,7 @@ wheels = [
 
 [[package]]
 name = "pipecat-dialt"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "dialt-sdk" },
@@ -2012,7 +2012,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dialt-sdk", specifier = ">=0.41.0,<0.42" },
+    { name = "dialt-sdk", specifier = ">=0.45.0,<0.46.0" },
     { name = "numpy", specifier = ">=1.26.4,<3" },
     { name = "pipecat-ai", specifier = ">=1.12.0,<2" },
     { name = "pyaudio", marker = "extra == 'local'", specifier = "~=0.2.14" },

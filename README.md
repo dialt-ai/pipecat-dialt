@@ -44,22 +44,19 @@ uv run python examples/foundational.py
 The important topology is:
 
 ```python
+from pipecat_dialt import DialtContextAggregatorPair, DialtLLMService
+
+context = LLMContext()
 llm = DialtLLMService(
     api_key=os.environ["DIALT_API_KEY"],
+    initial_context=context,
     mode=DialtMode(
         instructions="You are a concise, helpful voice assistant.",
         greeting="Hello! How can I help?",
     ),
 )
 
-context = LLMContext()
-user, assistant = LLMContextAggregatorPair(
-    context,
-    user_params=LLMUserAggregatorParams(
-        user_turn_strategies=ExternalUserTurnStrategies(),
-    ),
-    realtime_service_mode=True,
-)
+user, assistant = DialtContextAggregatorPair(context)
 pipeline = Pipeline(
     [
         transport.input(),
@@ -72,10 +69,42 @@ pipeline = Pipeline(
 ```
 
 There is intentionally no Pipecat VAD, Smart Turn analyzer, STT, second LLM, or TTS service. The
-example configures `ExternalUserTurnStrategies` explicitly so the aggregator never constructs a
-default Smart Turn analyzer. `DialtLLMService` also advertises those strategies when
-`DialtMode.turn_detection == "server"`; the universal user aggregator resolves Dialt's proposed
-turn frames and clears transport output on interruption.
+owned pair configures external turn strategies without constructing a default Smart Turn analyzer.
+Its semantic turn proposals do not authorize interruption: Dialt makes that decision separately.
+Use `DialtContextAggregatorPair`, not the stock pair, to keep the shared context consistent with
+accepted transcript revisions and avoid duplicate legacy/canonical appends.
+
+## Startup and initial history
+
+There are two explicit startup paths:
+
+- **Greeting-only (default):** pass `initial_context=context` and optionally `mode.greeting`.
+  `StartFrame` connects immediately after forwarding startup downstream; loading history is
+  silent and no `LLMRunFrame` is needed. Early SDK output cannot race pre-start aggregators.
+  This is the foundational microphone example and cannot wait on a transcript to connect.
+- **Framework startup run:** set `startup_run=True` and queue `LLMRunFrame()` after pipeline
+  start (for example in `on_pipeline_started`). The user aggregator supplies the initial
+  `LLMContextFrame`; the service disables automatic greeting before connecting and requests
+  one response after SDK readiness, using a stable operation ID. Repeated run/context frames
+  do not request a second startup response. `reply_ack` is admission/lifecycle, not speaker drain.
+
+With `startup_run=True`, `initial_context` is optional. If omitted, connection waits for the first
+context frame because Pipecat's `StartFrame` precedes it. Queue the startup run explicitly; never
+wait for microphone speech to produce that first context. Audio arriving before it is not sent.
+Supplying `initial_context` allows early connection with history while still requesting the startup
+response only when the framework runs it.
+
+The initial context imports user/assistant text and completed tool exchanges, correlated by call
+ID (not tool name or arrival order). Explicit service instructions come first, then framework
+system/developer messages in order, composed once. They are not history or synthetic caller text.
+Historical tools never execute. Pending tools, media and unsupported provider-specific messages
+fail explicitly. The SDK atomically enforces 256 items, 128 KiB total and 16 KiB per item before
+readiness or generation; the integration never truncates history.
+
+Later context frames synchronize tools and return results for dispatched application calls only.
+They never reimport the shared transcript or request responses. For a deliberately new typed caller
+turn, use the public SDK `llm.session.inject_context(text, role="user", reply=True)`; for a new
+host-requested reply without inventing a caller turn, use `request_reply(operation_id=...)`.
 
 ## Application tools
 
@@ -119,8 +148,7 @@ different conversational tier is required.
 
 ## Configuration
 
-Pass the published SDK's `DialtMode` to the service. `instructions` is required by
-`dialt-sdk>=0.41.0`.
+Pass the published SDK's `DialtMode` to the service. `instructions` is required.
 
 ```python
 mode = DialtMode(
@@ -130,12 +158,13 @@ mode = DialtMode(
     brain="fast",
     turn_detection="server",
 )
-llm = DialtLLMService(api_key=api_key, mode=mode)
+llm = DialtLLMService(api_key=api_key, mode=mode, initial_context=context)
 ```
 
 Constructor-only connection options are `base_url`, `user`, `timezone`, `session_id`,
 `connect_timeout_s`, `auto_reconnect`, `reconnect_base_s`, `reconnect_max_s`, and
-`max_reconnect_attempts`. Runtime `DialtLLMSettings` updates support `system_instruction`, `voice`,
+`max_reconnect_attempts`, `initial_context`, and `startup_run`.
+Runtime `DialtLLMSettings` updates support `system_instruction`, `voice`,
 `tools`, and `tool_choice`; the service delegates each change to the corresponding SDK method.
 
 `turn_detection="client"` is available for applications that deliberately provide their own turn
@@ -146,37 +175,65 @@ boundaries. In that mode the service does not advertise external strategies and 
 
 The service projects provider activity into standard frames:
 
-- `TranscriptionFrame` for final user ASR;
-- `ProposedUserStartedSpeakingFrame` / `ProposedUserStoppedSpeakingFrame` for server turns;
-- one `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame` pair per Dialt `turn_id`;
+- upstream `TranscriptionFrame` for final user ASR;
+- `DialtSpeechActivityFrame(speaking, speech_id)` promptly on detected speech start/stop; this
+  observer indication is not a Pipecat speaking proposal and cannot trigger local barge-in;
+- `ProposedUserStartedSpeakingFrame` / `ProposedUserStoppedSpeakingFrame` for provider-confirmed
+  semantic turns around final ASR (not speech-duration measurements), with interruptions disabled;
+- one `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame` pair per segment `turn_id`;
 - `LLMTextFrame`, `TTSTextFrame`, and 16 kHz mono `TTSAudioRawFrame` output;
 - standard Pipecat function-call lifecycle frames from `LLMService`.
 
 Pipecat 1.x has no standard correction or structured provider-error frame. This package exposes:
 
-- `DialtTranscriptCorrectionFrame`: replace the transcript identified by `turn_id`; do not append
-  a second turn;
+- `DialtTranscriptCorrectionFrame`: canonical observer revision with `item_id`, `revision`, role
+  and text; replace the matching display item, including empty-text retraction, rather than append;
 - `DialtErrorFrame`: a sanitized message plus stable `code` and `retryable` fields.
 
 ## Interruption and playback accounting
 
-On a Dialt `interrupted` event, the external turn strategy broadcasts Pipecat's interruption so
-the output transport drops queued audio. The service reports `playback_stopped` through the SDK,
-including `barge_seq` and estimated discarded milliseconds.
+An incoming Pipecat `InterruptionFrame` immediately closes local output and suppresses late events,
+then calls SDK `interrupt(response_id=...)` for the stable logical response. Provider interruption
+broadcasts a marked standard-interruption subclass to clear transport output; delayed echoes never
+interrupt a newer response. Response cancellation does not cancel application tools: only Dialt's
+separate `tool_cancel` event does so by call ID.
+
+Segment `done` does not end the logical target during tool waits. `response_done` ends generation
+only; it may arrive before final segment `done` and never drops that segment's delivered content.
+Playback tracking survives both until transport drain or a host discard. Host discard calls public
+SDK `playback_stopped(response_id, discarded_ms)`, including after producer completion.
 
 Pipecat 1.12 does not expose a generic device playback cursor or clear acknowledgement to upstream
 processors. Like Pipecat's built-in realtime providers, this integration estimates heard audio as
-the smaller of generated PCM duration and elapsed wall-clock playback time. A transport with a real
-device/client playback cursor should eventually expose that receipt to replace this approximation.
+the smaller of generated PCM duration and elapsed wall-clock playback time. At the first audio
+chunk of each new segment, it carries forward only the estimated unplayed residual and resets the
+clock, so a bridge/tool wait cannot consume newly queued final audio. This remains an estimate:
+transport buffering, gaps within a segment and device latency are not measured. A transport with a
+real device/client playback cursor should expose that receipt to replace this approximation.
+
+## Accepted conversation and revisions
+
+`session.conversation` is a detached read-only `{items, first_index}` SDK projection. The owned pair
+maps accepted item IDs to shared-context messages in order, updates revisions in place for both
+roles, and removes empty retractions. It does not buffer provisional Dialt text as accepted history,
+so a late aggregation flush cannot restore a corrected transcript. Resume snapshots reconcile the
+retained window; `first_index` makes eviction explicit. Observers can also inspect upstream
+conversation frames. Host system/developer instructions remain separate; internal prompts, hidden
+reasoning and managed tools are never imported from Dialt. Customer tool result business fields
+remain intact. This projection does not edit broker history.
 
 ## Compatibility
 
 | pipecat-dialt | Python | Pipecat tested | dialt-sdk tested |
 | --- | --- | --- | --- |
 | 0.1.x | 3.11–3.13 | 1.12.0 | 0.41.0 |
+| 0.2.x | 3.11–3.13 | 1.12.0 | 0.45.0 |
 
 Dependencies intentionally use bounded ranges (`pipecat-ai>=1.12,<2`,
-`dialt-sdk>=0.41,<0.42`). Every release must update this table with the exact versions exercised.
+`dialt-sdk>=0.45.0,<0.46.0`). Version 0.2 requires the coordinated broker capabilities
+`conversation_v1`, `request_reply_v1`, `targeted_interrupt_v1`, and `speech_activity_v1`;
+unsupported servers fail explicitly rather than silently falling back. Every release must update
+this table with the exact versions exercised.
 
 ## Development
 

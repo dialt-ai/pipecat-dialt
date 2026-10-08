@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallFromLLM,
     InputAudioRawFrame,
+    InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -39,6 +40,7 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     ProposedUserStartedSpeakingFrame,
     ProposedUserStoppedSpeakingFrame,
+    StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -48,7 +50,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.aggregators import async_tool_messages
 from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings, ServiceSettings
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
@@ -57,7 +59,13 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 from .adapter import DialtLLMAdapter
-from .frames import DialtErrorFrame, DialtTranscriptCorrectionFrame
+from .frames import (
+    DialtConversationFrame,
+    DialtErrorFrame,
+    DialtInterruptionFrame,
+    DialtSpeechActivityFrame,
+    DialtTranscriptCorrectionFrame,
+)
 
 
 @dataclass
@@ -78,11 +86,19 @@ class DialtLLMSettings(LLMSettings):
 @dataclass
 class _ResponseState:
     turn_id: str
+    response_id: str
     text: str = ""
     audio_started: bool = False
     generated_audio_ms: int = 0
     playback_started_at: float | None = None
-    barge_seq: int | None = None
+
+    def estimated_pending_audio_ms(self, now: float) -> int:
+        elapsed_ms = (
+            round((now - self.playback_started_at) * 1000)
+            if self.playback_started_at is not None
+            else 0
+        )
+        return max(0, self.generated_audio_ms - elapsed_ms)
 
 
 class DialtLLMService(LLMService[DialtLLMAdapter]):
@@ -113,6 +129,8 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         reconnect_base_s: float = 0.5,
         reconnect_max_s: float = 5.0,
         max_reconnect_attempts: int = 12,
+        initial_context: LLMContext | None = None,
+        startup_run: bool = False,
         **kwargs: Any,
     ) -> None:
         """Create a Dialt service using a complete SDK ``DialtMode``."""
@@ -156,14 +174,23 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         self._session: DialtSession | None = None
         self._event_task: asyncio.Task[Any] | None = None
         self._disconnecting = False
-        self._context: LLMContext | None = None
-        self._last_context_message_count = 0
-        self._provider_user_turns_pending = 0
+        self._context = initial_context
+        self._initial_context = initial_context
+        self._framework_instructions: str | None = None
+        self._startup_run = startup_run
+        self._startup_requested = False
+        self._startup_reply_ack: dict[str, Any] | None = None
+        self._startup_operation_id = f"pipecat-startup-{uuid.uuid4()}"
+        self._playback: dict[str, _ResponseState] = {}
         self._input_speech_active = False
         self._response: _ResponseState | None = None
+        self._active_response_id: str | None = None
         self._closed_turns: set[str] = set()
+        self._closed_segments: set[str] = set()
+        self._finished_responses: set[str] = set()
         self._dispatched_tool_calls: set[str] = set()
         self._completed_tool_calls: set[str] = set()
+        self._projected_revisions: dict[str, int] = {}
         self._terminal_tool_results: dict[str, tuple[Any, str]] = {}
         self._resampler: Any | None = None
         self._resampler_input_rate: int | None = None
@@ -173,6 +200,11 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         """Return the active SDK session for diagnostics and advanced controls."""
         return self._session
 
+    @property
+    def startup_reply_ack(self) -> dict[str, Any] | None:
+        """Return the latest startup admission/lifecycle receipt, not playback evidence."""
+        return dict(self._startup_reply_ack) if self._startup_reply_ack is not None else None
+
     def service_metadata_frame(self) -> LLMServiceMetadataFrame:
         """Advertise Dialt's server-driven turn boundaries when enabled."""
         server_turns = self._base_mode.turn_detection == "server"
@@ -180,15 +212,28 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         return LLMServiceMetadataFrame(
             service_name=self.name,
             is_realtime_service=True,
-            user_turn_strategies=ExternalUserTurnStrategies() if server_turns else None,
+            user_turn_strategies=(
+                ExternalUserTurnStrategies(enable_interruptions=False) if server_turns else None
+            ),
         )
 
     def _effective_mode(self) -> DialtMode:
         tools = assert_given(self._settings.tools)
         provider_tools = self._convert_tools(tools)
+        instruction = cast(str, assert_given(self._settings.system_instruction))
+        if self._initial_context is not None:
+            invocation = self.get_llm_adapter().get_llm_invocation_params(self._initial_context)
+            if self._framework_instructions is None:
+                self._framework_instructions = invocation["system_instruction"] or ""
+            if is_given(self._initial_context.tools):
+                provider_tools = invocation["tools"]
+        instruction = "\n\n".join(
+            part for part in (instruction, self._framework_instructions) if part
+        )
         return dataclasses.replace(
             self._base_mode,
-            instructions=cast(str, assert_given(self._settings.system_instruction)),
+            instructions=instruction,
+            greeting=False if self._startup_run else self._base_mode.greeting,
             voice=assert_given(self._settings.voice),
             tools=provider_tools,
             tool_choice=assert_given(self._settings.tool_choice),
@@ -203,12 +248,9 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         return cast(list[ToolDefinition] | None, tools)
 
     def _service_tools(self) -> ToolsSchema | list[Any] | None:
+        if self._initial_context is not None and is_given(self._initial_context.tools):
+            return self._initial_context.tools
         return assert_given(self._settings.tools)
-
-    async def setup(self, setup: FrameProcessorSetup) -> None:  # type: ignore[override]
-        """Set up Pipecat state and open the SDK-owned session."""
-        await super().setup(setup)
-        await self._connect()
 
     async def cleanup(self) -> None:
         """Release the SDK session and all local tasks idempotently."""
@@ -235,6 +277,11 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
                 session_id=self._session_id,
                 sr=OUTPUT_SR,
                 mode=self._effective_mode(),
+                initial_history=(
+                    self.get_llm_adapter().initial_history(self._initial_context)
+                    if self._initial_context is not None
+                    else []
+                ),
                 user=self._user,
                 timezone=self._timezone,
                 connect_timeout_s=self._connect_timeout_s,
@@ -263,13 +310,16 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
                 await self._resampler.reset()
         finally:
             self._response = None
+            self._active_response_id = None
+            self._playback.clear()
             self._context = None
-            self._last_context_message_count = 0
-            self._provider_user_turns_pending = 0
             self._input_speech_active = False
             self._closed_turns.clear()
+            self._closed_segments.clear()
+            self._finished_responses.clear()
             self._dispatched_tool_calls.clear()
             self._completed_tool_calls.clear()
+            self._projected_revisions.clear()
             self._terminal_tool_results.clear()
             self._disconnecting = False
 
@@ -277,8 +327,18 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         """Send transport media and application controls into the Dialt session."""
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, StartFrame):
+            # Open only after downstream processors receive StartFrame: setup-time
+            # consumption can otherwise drop an immediate greeting or snapshot.
+            await self.push_frame(frame, direction)
+            if not self._startup_run or self._initial_context is not None:
+                await self._connect()
+            return
         if isinstance(frame, InputAudioRawFrame):
             await self._send_audio(frame)
+        elif isinstance(frame, InterruptionFrame):
+            if not isinstance(frame, DialtInterruptionFrame):
+                await self._interrupt_local()
         elif isinstance(frame, LLMContextFrame):
             await self._handle_context(frame.context)
         elif isinstance(frame, LLMSetToolsFrame):
@@ -291,10 +351,15 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
             if self._base_mode.turn_detection == "client" and self._session is not None:
                 await self._session.finish_input_turn()
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            if self._response is not None:
-                self._response.playback_started_at = None
+            # The transport has drained, unlike a producer's done event.
+            self._playback.clear()
 
         await self.push_frame(frame, direction)
+
+    async def _handle_interruptions(self, frame: InterruptionFrame) -> None:
+        # Pipecat's default implementation cancels tool tasks on barge-in. Dialt
+        # separates response cancellation from explicit, call-ID scoped tool_cancel.
+        return
 
     async def _send_audio(self, frame: InputAudioRawFrame) -> None:
         session = self._session
@@ -338,12 +403,33 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
                 await self._push_dialt_error("event_consumer_failed", True)
 
     async def _handle_event(self, event: SessionEvent) -> None:
+        # A tool-first or acknowledged response can be interrupted before any turn/audio.
+        if event.type == "tool_call" or (
+            event.type == "reply_ack" and event.data.get("status") == "started"
+        ):
+            response_id = event.data.get("response_id")
+            if (
+                isinstance(response_id, str)
+                and response_id not in self._closed_turns
+                and response_id not in self._finished_responses
+            ):
+                self._active_response_id = response_id
+        if (
+            event.type == "reply_ack"
+            and event.data.get("operation_id") == self._startup_operation_id
+        ):
+            self._startup_reply_ack = dict(event.data)
         handlers = {
+            "conversation_snapshot": self._handle_conversation,
+            "conversation_item": self._handle_conversation,
+            "speech_started": self._handle_speech_activity,
+            "speech_stopped": self._handle_speech_activity,
             "turn": self._handle_turn,
             "text_delta": self._handle_text_delta,
             "audio": self._handle_audio,
             "utterance": self._handle_utterance,
             "done": self._handle_done,
+            "response_done": self._handle_response_done,
             "interrupted": self._handle_interrupted,
             "canceled": self._handle_canceled,
             "asr": self._handle_asr,
@@ -360,11 +446,23 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
 
     async def _handle_turn(self, event: SessionEvent) -> None:
         turn_id = self._turn_id(event.data)
-        if not turn_id or turn_id in self._closed_turns:
+        response_id = event.data.get("response_id")
+        if (
+            not turn_id
+            or not isinstance(response_id, str)
+            or response_id in self._closed_turns
+            or turn_id in self._closed_segments
+        ):
             return
         if self._response is not None:
+            if self._response.response_id == response_id:
+                self._response.turn_id = turn_id
+                return
             await self._close_response(interrupted=True, clear_output=True)
-        self._response = _ResponseState(turn_id=turn_id)
+        self._response = _ResponseState(turn_id=turn_id, response_id=response_id)
+        if response_id not in self._finished_responses:
+            self._active_response_id = response_id
+        self._playback.setdefault(response_id, self._response)
         await self.start_processing_metrics()
         await self.start_ttfb_metrics()
         await self.push_frame(LLMFullResponseStartFrame())
@@ -379,16 +477,21 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         await self._push_text(delta)
 
     async def _handle_audio(self, event: SessionEvent) -> None:
-        response = self._response
+        response = self._response_for(event.data)
         if response is None or event.audio is None or not event.audio.size:
             return
+        playback = self._playback.setdefault(response.response_id, response)
         if not response.audio_started:
+            now = time.perf_counter()
+            # Carry only the previous segment's estimated unplayed residual. Tool
+            # wait time cannot count as playback of this segment's future audio.
+            playback.generated_audio_ms = playback.estimated_pending_audio_ms(now)
+            playback.playback_started_at = now
             response.audio_started = True
-            response.playback_started_at = time.perf_counter()
             await self.stop_ttfb_metrics()
             await self.push_frame(TTSStartedFrame(context_id=response.turn_id))
         pcm = float32_to_pcm16(event.audio)
-        response.generated_audio_ms += round(len(pcm) / 2 * 1000 / OUTPUT_SR)
+        playback.generated_audio_ms += round(len(pcm) / 2 * 1000 / OUTPUT_SR)
         await self.push_frame(
             TTSAudioRawFrame(
                 pcm,
@@ -406,36 +509,36 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         if not response.text:
             response.text = text
             await self._push_text(text)
-        elif event.data.get("corrected") or text != response.text:
-            response.text = text
-            await self.push_frame(
-                DialtTranscriptCorrectionFrame(
-                    turn_id=response.turn_id,
-                    text=text,
-                    speaker="assistant",
-                    revision=self._revision(event.data),
-                    result=dict(event.data),
-                )
-            )
 
     async def _handle_done(self, event: SessionEvent) -> None:
         if self._response_for(event.data) is not None:
             await self._close_response(interrupted=False, clear_output=False)
 
+    async def _handle_response_done(self, event: SessionEvent) -> None:
+        response_id = event.data.get("response_id")
+        if isinstance(response_id, str):
+            self._finished_responses.add(response_id)
+        if response_id == self._active_response_id:
+            self._active_response_id = None
+
     async def _handle_interrupted(self, event: SessionEvent) -> None:
-        response = self._response_for(event.data)
-        if response is None:
+        response_id = event.data.get("response_id")
+        if not isinstance(response_id, str) or response_id in self._closed_turns:
             return
-        response.barge_seq = self._optional_int(event.data.get("barge_seq"))
-        if not self._input_speech_active:
-            self._input_speech_active = True
-            await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
-        await self._report_playback_stopped(response)
-        await self._close_response(interrupted=True, clear_output=False)
+        self._closed_turns.add(response_id)
+        if response_id == self._active_response_id:
+            self._active_response_id = None
+        playback = self._playback.get(response_id)
+        if playback is not None:
+            await self._report_playback_stopped(playback)
+        # Even after producer completion, queued output can require a discard.
+        if self._response is not None and self._response.response_id == response_id:
+            await self._close_response(interrupted=True, clear_output=True)
+        elif playback is not None and self._response is None and self._active_response_id is None:
+            await self.broadcast_frame(DialtInterruptionFrame, response_id=response_id)
 
     async def _handle_canceled(self, event: SessionEvent) -> None:
-        if self._response_for(event.data) is not None:
-            await self._close_response(interrupted=True, clear_output=True)
+        await self._handle_interrupted(event)
 
     async def _handle_asr(self, event: SessionEvent) -> None:
         text = event.data.get("text")
@@ -444,7 +547,6 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         if not self._input_speech_active:
             self._input_speech_active = True
             await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
-        self._provider_user_turns_pending += 1
         await self.push_frame(
             TranscriptionFrame(
                 text,
@@ -452,24 +554,16 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
                 timestamp=time_now_iso8601(),
                 result=dict(event.data),
                 finalized=True,
-            )
+            ),
+            FrameDirection.UPSTREAM,
         )
         self._input_speech_active = False
         await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
 
     async def _handle_asr_correction(self, event: SessionEvent) -> None:
-        text = event.data.get("text")
-        turn_id = self._turn_id(event.data)
-        if isinstance(text, str) and text and turn_id:
-            await self.push_frame(
-                DialtTranscriptCorrectionFrame(
-                    turn_id=turn_id,
-                    text=text,
-                    speaker="user",
-                    revision=self._revision(event.data),
-                    result=dict(event.data),
-                )
-            )
+        # conversation_item revisions are authoritative; legacy corrections must not
+        # race or duplicate their canonical observer notification.
+        return
 
     async def _handle_tool_call(self, event: SessionEvent) -> None:
         call_id = event.data.get("id")
@@ -516,13 +610,19 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         self._terminal_tool_results[call_id] = (None, "cancelled")
 
     async def _handle_reconnecting(self, event: SessionEvent) -> None:
+        if self._active_response_id is not None:
+            self._closed_turns.add(self._active_response_id)
+        self._active_response_id = None
         if self._response is not None:
             await self._close_response(interrupted=True, clear_output=True)
+        elif self._playback:
+            response_id = next(reversed(self._playback))
+            await self.broadcast_frame(DialtInterruptionFrame, response_id=response_id)
+        self._playback.clear()
 
     async def _handle_terminal_error(self, event: SessionEvent) -> None:
         await self._handle_error(event)
-        if self._response is not None:
-            await self._close_response(interrupted=True, clear_output=True)
+        await self._handle_reconnecting(event)
 
     async def _handle_error(self, event: SessionEvent) -> None:
         await self._push_dialt_error(
@@ -534,9 +634,11 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         response, self._response = self._response, None
         if response is None:
             return
-        self._closed_turns.add(response.turn_id)
+        self._closed_segments.add(response.turn_id)
+        if interrupted:
+            self._closed_turns.add(response.response_id)
         if clear_output:
-            await self.broadcast_interruption()  # type: ignore[no-untyped-call]
+            await self.broadcast_frame(DialtInterruptionFrame, response_id=response.response_id)
         if response.audio_started:
             await self.push_frame(TTSStoppedFrame(context_id=response.turn_id))
         await self.push_frame(LLMFullResponseEndFrame())
@@ -546,49 +648,41 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         session = self._session
         if session is None:
             return
-        elapsed_ms = 0
-        if response.playback_started_at is not None:
-            elapsed_ms = round((time.perf_counter() - response.playback_started_at) * 1000)
-        discarded_ms = max(
-            0,
-            response.generated_audio_ms - min(elapsed_ms, response.generated_audio_ms),
-        )
-        fields: dict[str, Any] = {"discarded_ms": discarded_ms}
-        if response.barge_seq is not None:
-            fields["barge_seq"] = response.barge_seq
-        await session.send_client_event("playback_stopped", **fields)
+        discarded_ms = response.estimated_pending_audio_ms(time.perf_counter())
+        await session.playback_stopped(response.response_id, discarded_ms)
+        self._playback.pop(response.response_id, None)
 
     async def _push_text(self, text: str) -> None:
         llm_frame = LLMTextFrame(text)
         llm_frame.append_to_context = False
         await self.push_frame(llm_frame)
         tts_frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        tts_frame.append_to_context = False
         tts_frame.includes_inter_frame_spaces = True
         await self.push_frame(tts_frame)
 
     async def _handle_context(self, context: LLMContext) -> None:
-        first_context = self._context is None
-        previous_count = self._last_context_message_count
         self._context = context
-        messages = context.get_messages()
-        self._last_context_message_count = len(messages)
+        if self._session is None:
+            self._initial_context = context
+            await self._connect()
         await self._sync_context_configuration(context)
-        await self._process_completed_function_calls(send_results=not first_context)
-        if first_context:
-            return
-
-        new_messages = messages[previous_count:]
-        for message in new_messages:
-            if isinstance(message, LLMSpecificMessage) or not isinstance(message, Mapping):
-                continue
-            if message.get("role") != "user":
-                continue
-            if self._provider_user_turns_pending:
-                self._provider_user_turns_pending -= 1
-                continue
-            text = DialtLLMAdapter._text_content(message.get("content"))
-            if text and self._session is not None:
-                await self._session.inject_context(text, role="user", reply=True)
+        await self._process_completed_function_calls()
+        if self._startup_run and not self._startup_requested and self._session is not None:
+            self._startup_requested = True
+            ack = await self._session.request_reply(operation_id=self._startup_operation_id)
+            if self._startup_reply_ack is None:
+                self._startup_reply_ack = dict(ack)
+            if ack.get("status") == "started":
+                response_id = ack.get("response_id")
+                if (
+                    isinstance(response_id, str)
+                    and response_id not in self._finished_responses
+                    and response_id not in self._closed_turns
+                ):
+                    self._active_response_id = response_id
+            if not ack.get("accepted"):
+                await self._push_dialt_error("startup_reply_rejected", False)
 
     async def _sync_context_configuration(self, context: LLMContext) -> None:
         invocation = self.get_llm_adapter().get_llm_invocation_params(
@@ -598,13 +692,10 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
         session = self._session
         if session is None:
             return
-        instruction = invocation["system_instruction"]
-        if instruction and instruction != assert_given(self._settings.system_instruction):
-            await session.set_instructions(instruction)
         if is_given(context.tools):
             await session.set_tools(invocation["tools"])
 
-    async def _process_completed_function_calls(self, *, send_results: bool) -> None:
+    async def _process_completed_function_calls(self) -> None:
         if self._context is None:
             return
         for message in self._context.get_messages():
@@ -617,7 +708,7 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
                 if async_payload.kind == "intermediate":
                     await self._push_dialt_error("intermediate_tool_result_unsupported", False)
                 elif async_payload.kind == "final":
-                    if send_results or async_payload.tool_call_id in self._dispatched_tool_calls:
+                    if async_payload.tool_call_id in self._dispatched_tool_calls:
                         await self._send_tool_result(
                             async_payload.tool_call_id, async_payload.result
                         )
@@ -628,7 +719,7 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
             call_id = message.get("tool_call_id")
             if not isinstance(call_id, str) or call_id in self._completed_tool_calls:
                 continue
-            if send_results or call_id in self._dispatched_tool_calls:
+            if call_id in self._dispatched_tool_calls:
                 await self._send_tool_result(call_id, message.get("content"))
             self._completed_tool_calls.add(call_id)
 
@@ -666,7 +757,9 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
             instruction = assert_given(self._settings.system_instruction)
             if not instruction:
                 raise ValueError("Dialt system_instruction must be non-empty")
-            await session.set_instructions(instruction)
+            await session.set_instructions(
+                "\n\n".join(part for part in (instruction, self._framework_instructions) if part)
+            )
         if "voice" in changed:
             voice = assert_given(self._settings.voice)
             if voice is not None:
@@ -697,20 +790,62 @@ class DialtLLMService(LLMService[DialtLLMAdapter]):
 
     def _response_for(self, data: Mapping[str, Any]) -> _ResponseState | None:
         response = self._response
+        response_id = data.get("response_id")
         turn_id = self._turn_id(data)
-        if response is None or (turn_id is not None and turn_id != response.turn_id):
+        if (
+            response is None
+            or response_id != response.response_id
+            or response.response_id in self._closed_turns
+            or (turn_id is not None and turn_id != response.turn_id)
+        ):
             return None
         return response
+
+    async def _interrupt_local(self) -> None:
+        session = self._session
+        response_id, self._active_response_id = self._active_response_id, None
+        if self._response is not None:
+            await self._close_response(interrupted=True, clear_output=False)
+        if response_id is not None:
+            self._closed_turns.add(response_id)
+        # Producer completion is not speaker drain. Account for every queued response.
+        for playback in list(self._playback.values()):
+            await self._report_playback_stopped(playback)
+        if response_id is None or session is None:
+            return
+        await session.interrupt(response_id=response_id)
+
+    async def _handle_speech_activity(self, event: SessionEvent) -> None:
+        await self.broadcast_frame(
+            DialtSpeechActivityFrame,
+            speaking=event.type == "speech_started",
+            speech_id=event.data.get("speech_id"),
+        )
+
+    async def _handle_conversation(self, event: SessionEvent) -> None:
+        if self._session is None:
+            return
+        projection = self._session.conversation
+        await self.push_frame(DialtConversationFrame(**projection), FrameDirection.UPSTREAM)
+        # The SDK may already have processed newer events while this consumer was
+        # awaiting Pipecat. Notify from its current accepted projection, never stale data.
+        for item in projection["items"]:
+            previous = self._projected_revisions.get(item["item_id"], 0)
+            self._projected_revisions[item["item_id"]] = item["revision"]
+            if item["kind"] == "tool_result":
+                self._completed_tool_calls.add(item["call_id"])
+            if item["kind"] == "message" and item["revision"] > max(previous, 1):
+                await self.push_frame(
+                    DialtTranscriptCorrectionFrame(
+                        turn_id=str(event.data.get("turn_id", "")),
+                        item_id=item["item_id"],
+                        revision=item["revision"],
+                        text=item["text"],
+                        speaker=item["role"],
+                    )
+                )
 
     @staticmethod
     def _turn_id(data: Mapping[str, Any]) -> str | None:
         value = data.get("turn_id")
         return str(value) if value is not None and str(value) else None
-
-    @staticmethod
-    def _revision(data: Mapping[str, Any]) -> int | None:
-        return DialtLLMService._optional_int(data.get("revision"))
-
-    @staticmethod
-    def _optional_int(value: Any) -> int | None:
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
