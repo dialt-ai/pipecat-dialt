@@ -16,4 +16,8 @@ The workflow uses OIDC; do not add a PyPI API token to GitHub.
 6. Verify the workflow's attestations and a clean-environment installation from PyPI.
 7. Only after a public package and demo exist, submit the separate official Pipecat docs listing.
 
+If publication fails before uploading distributions, fix the workflow on main and use its manual
+dispatch with the existing release tag. The workflow checks out that tag, preserving the reviewed
+package source without moving a published tag or republishing the GitHub release.
+
 Publishing, pushing tags, and submitting upstream documentation require explicit maintainer action.
