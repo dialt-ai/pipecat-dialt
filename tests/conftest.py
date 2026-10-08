@@ -16,10 +16,26 @@ class FakeSession:
         self.tool_results: list[tuple[str, Any, str]] = []
         self.tools: list[list[Any]] = []
         self.injections: list[tuple[str, str, bool]] = []
+        self.replies: list[str] = []
+        self.interrupts: list[str] = []
+        self.conversation: dict[str, Any] = {"items": [], "first_index": 0}
         self.closed = 0
 
     async def send_audio(self, audio: bytes) -> None:
         self.audio.append(audio)
+
+    async def request_reply(self, *, operation_id: str) -> dict[str, Any]:
+        self.replies.append(operation_id)
+        return {"accepted": True, "status": "queued", "operation_id": operation_id}
+
+    async def interrupt(self, *, response_id: str) -> dict[str, Any]:
+        self.interrupts.append(response_id)
+        return {"accepted": True}
+
+    async def playback_stopped(self, response_id: str, discarded_ms: float) -> None:
+        await self.send_client_event(
+            "playback_stopped", response_id=response_id, discarded_ms=discarded_ms
+        )
 
     async def send_client_event(self, event: str, **fields: Any) -> None:
         self.client_events.append((event, fields))
@@ -65,6 +81,7 @@ class CapturingService(DialtLLMService):
             ),
         )
         self.frames: list[Any] = []
+        self.directions: list[FrameDirection] = []
         self.broadcasts: list[type[Any]] = []
         self.interruptions = 0
 
@@ -74,6 +91,7 @@ class CapturingService(DialtLLMService):
         direction: FrameDirection = FrameDirection.DOWNSTREAM,
     ) -> None:
         self.frames.append(frame)
+        self.directions.append(direction)
 
     async def broadcast_frame(self, frame_type: type[Any], **kwargs: Any) -> None:
         self.broadcasts.append(frame_type)

@@ -110,6 +110,7 @@ async def test_tool_result_keeps_encoded_string_and_is_sent_once(
     assert isinstance(session, FakeSession)
     context = LLMContext()
     await service._handle_context(context)
+    service._dispatched_tool_calls.add("call-1")
     encoded = '{"status":"ok"}'
     context.add_message({"role": "tool", "tool_call_id": "call-1", "content": encoded})
     await service._handle_context(context)
@@ -163,28 +164,26 @@ async def test_resumed_tool_reannouncement_replays_result_without_execution(
 
 
 @pytest.mark.asyncio
-async def test_provider_turn_marker_survives_intervening_non_user_context(
+async def test_context_sync_never_echoes_provider_or_requests_reply(
     service: CapturingService,
 ) -> None:
     session = service._session
     assert isinstance(session, FakeSession)
     context = LLMContext()
     await service._handle_context(context)
-    service._provider_user_turns_pending = 1
 
     context.add_message({"role": "assistant", "content": "working"})
     context.add_message({"role": "tool", "tool_call_id": "c", "content": "done"})
     await service._handle_context(context)
-    assert service._provider_user_turns_pending == 1
 
     context.add_message({"role": "user", "content": "provider transcript"})
     await service._handle_context(context)
-    assert service._provider_user_turns_pending == 0
     assert session.injections == []
 
     context.add_message({"role": "user", "content": "typed follow-up"})
     await service._handle_context(context)
-    assert session.injections == [("typed follow-up", "user", True)]
+    assert session.injections == []
+    assert session.replies == []
 
 
 @pytest.mark.asyncio
